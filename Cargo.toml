@@ -16,5 +16,4 @@ winit = "0.29"
 tracy-client = { version = "^0.18.0", optional = true }
 
 [features]
-# Define a feature in your crate that enables the 'enable' feature of tracy-client
 tracy = ["tracy-client/enable"]
