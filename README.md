@@ -1,2 +1,2 @@
 # vulkan-map
-Rust application for rendering raster map tiles with Vulkan
+Rust application for rendering OSM tiles with Vulkan
