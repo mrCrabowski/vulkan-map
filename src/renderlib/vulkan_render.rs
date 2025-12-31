@@ -21,6 +21,7 @@ type Mat4 = cgmath::Matrix4<f32>;
 use std::time::Instant;
 
 use super::vulkan_app_data::AppData;
+use super::vulkan_app_data::INDICES;
 use super::vulkan_app_data::MAX_FRAMES_IN_FLIGHT;
 use super::vulkan_app_data::UniformBufferObject;
 use super::vulkan_app_data::VALIDATION_ENABLED;
@@ -127,6 +128,8 @@ impl App {
         // Помечаем image как используемое этим frame
         self.data.images_in_flight[image_index] = in_flight_fence;
 
+        // Обновление команд и данных
+        self.update_command_buffer(image_index)?;
         self.update_uniform_buffer(image_index)?;
 
         // 3. Graphics queue (ждёт image_available_semaphores[frame], сигналит render_finished_semaphores[image_index])
@@ -201,6 +204,64 @@ impl App {
 
         self.device
             .unmap_memory(self.data.uniform_buffers_memory[image_index]);
+
+        Ok(())
+    }
+
+    unsafe fn update_command_buffer(&mut self, image_index: usize) -> Result<()> {
+        let command_buffer = self.data.command_buffers[image_index];
+
+        self.device
+            .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())?;
+
+        let info = vk::CommandBufferBeginInfo::builder();
+
+        self.device.begin_command_buffer(command_buffer, &info)?;
+
+        let render_area = vk::Rect2D::builder()
+            .offset(vk::Offset2D::default())
+            .extent(self.data.swapchain_extent);
+
+        let color_clear_value = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        };
+
+        let clear_values = &[color_clear_value];
+        let info = vk::RenderPassBeginInfo::builder()
+            .render_pass(self.data.render_pass)
+            .framebuffer(self.data.framebuffers[image_index])
+            .render_area(render_area)
+            .clear_values(clear_values);
+
+        self.device
+            .cmd_begin_render_pass(command_buffer, &info, vk::SubpassContents::INLINE);
+        self.device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.data.pipeline,
+        );
+        self.device
+            .cmd_bind_vertex_buffers(command_buffer, 0, &[self.data.vertex_buffer], &[0]);
+        self.device.cmd_bind_index_buffer(
+            command_buffer,
+            self.data.index_buffer,
+            0,
+            vk::IndexType::UINT16,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.data.pipeline_layout,
+            0,
+            &[self.data.descriptor_sets[image_index]],
+            &[],
+        );
+        self.device
+            .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+        self.device.cmd_end_render_pass(command_buffer);
+        self.device.end_command_buffer(command_buffer)?;
 
         Ok(())
     }

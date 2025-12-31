@@ -39,6 +39,23 @@ const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[vk::KHR_SWAPCHAIN_EXTENSION.na
 
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
+static VERTICES: [Vertex; 4] = [
+    Vertex::new(vec2(-1.0, -1.0), vec3(1.0, 0.0, 0.0), vec2(1.0, 0.0)),
+    Vertex::new(vec2(1.0, -1.0), vec3(0.0, 1.0, 0.0), vec2(0.0, 0.0)),
+    Vertex::new(vec2(1.0, 1.0), vec3(0.0, 0.0, 1.0), vec2(0.0, 1.0)),
+    Vertex::new(vec2(-1.0, 1.0), vec3(1.0, 1.0, 1.0), vec2(1.0, 1.0)),
+];
+
+pub const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct UniformBufferObject {
+    pub model: Mat4,
+    pub view: Mat4,
+    pub proj: Mat4,
+}
+
 /// The Vulkan handles and associated properties used by our Vulkan app.
 #[derive(Clone, Debug, Default)]
 pub struct AppData {
@@ -81,7 +98,7 @@ pub struct AppData {
     pub uniform_buffers_memory: Vec<vk::DeviceMemory>,
 
     pub descriptor_pool: vk::DescriptorPool,
-    descriptor_sets: Vec<vk::DescriptorSet>,
+    pub descriptor_sets: Vec<vk::DescriptorSet>,
 
     mip_levels: u32,
     pub texture_image: vk::Image,
@@ -686,7 +703,9 @@ pub unsafe fn create_command_pool(
 ) -> Result<()> {
     let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
 
-    let info = vk::CommandPoolCreateInfo::builder().queue_family_index(indices.graphics);
+    let info = vk::CommandPoolCreateInfo::builder()
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+        .queue_family_index(indices.graphics);
 
     data.command_pool = device.create_command_pool(&info, None)?;
 
@@ -816,51 +835,6 @@ pub unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Res
         .command_buffer_count(data.framebuffers.len() as u32);
 
     data.command_buffers = device.allocate_command_buffers(&allocate_info)?;
-
-    // Commands
-
-    for (i, command_buffer) in data.command_buffers.iter().enumerate() {
-        let info = vk::CommandBufferBeginInfo::builder();
-
-        device.begin_command_buffer(*command_buffer, &info)?;
-
-        let render_area = vk::Rect2D::builder()
-            .offset(vk::Offset2D::default())
-            .extent(data.swapchain_extent);
-
-        let color_clear_value = vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 1.0],
-            },
-        };
-
-        let clear_values = &[color_clear_value];
-        let info = vk::RenderPassBeginInfo::builder()
-            .render_pass(data.render_pass)
-            .framebuffer(data.framebuffers[i])
-            .render_area(render_area)
-            .clear_values(clear_values);
-
-        device.cmd_begin_render_pass(*command_buffer, &info, vk::SubpassContents::INLINE);
-        device.cmd_bind_pipeline(
-            *command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            data.pipeline,
-        );
-        device.cmd_bind_vertex_buffers(*command_buffer, 0, &[data.vertex_buffer], &[0]);
-        device.cmd_bind_index_buffer(*command_buffer, data.index_buffer, 0, vk::IndexType::UINT16);
-        device.cmd_bind_descriptor_sets(
-            *command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            data.pipeline_layout,
-            0,
-            &[data.descriptor_sets[i]],
-            &[],
-        );
-        device.cmd_draw_indexed(*command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
-        device.cmd_end_render_pass(*command_buffer);
-        device.end_command_buffer(*command_buffer)?;
-    }
 
     Ok(())
 }
@@ -1633,21 +1607,4 @@ pub unsafe fn create_texture_sampler(device: &Device, data: &mut AppData) -> Res
 
     data.texture_sampler = device.create_sampler(&info, None)?;
     Ok(())
-}
-
-static VERTICES: [Vertex; 4] = [
-    Vertex::new(vec2(-1.0, -1.0), vec3(1.0, 0.0, 0.0), vec2(1.0, 0.0)),
-    Vertex::new(vec2(1.0, -1.0), vec3(0.0, 1.0, 0.0), vec2(0.0, 0.0)),
-    Vertex::new(vec2(1.0, 1.0), vec3(0.0, 0.0, 1.0), vec2(0.0, 1.0)),
-    Vertex::new(vec2(-1.0, 1.0), vec3(1.0, 1.0, 1.0), vec2(1.0, 1.0)),
-];
-
-const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub struct UniformBufferObject {
-    pub model: Mat4,
-    pub view: Mat4,
-    pub proj: Mat4,
 }
