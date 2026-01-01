@@ -12,17 +12,19 @@ use std::collections::HashSet;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 
+use vulkanalia::Device;
 use vulkanalia::vk::ExtDebugUtilsExtensionInstanceCommands;
 use vulkanalia::vk::KhrSurfaceExtensionInstanceCommands;
 use vulkanalia::vk::KhrSwapchainExtensionDeviceCommands;
 
 use winit::window::Window;
 
-use std::fs::File;
-
 use cgmath::{vec2, vec3};
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping as memcpy;
+
+use crate::profile_span;
+use crate::renderlib::textures::raw_image::RawImage;
 type Vec2 = cgmath::Vector2<f32>;
 type Vec3 = cgmath::Vector3<f32>;
 type Mat4 = cgmath::Matrix4<f32>;
@@ -54,6 +56,21 @@ pub struct UniformBufferObject {
     pub model: Mat4,
     pub view: Mat4,
     pub proj: Mat4,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceImage {
+    pub texture_image: vk::Image,
+    pub texture_image_memory: vk::DeviceMemory,
+    pub texture_image_view: vk::ImageView,
+}
+
+impl DeviceImage {
+    pub unsafe fn destroy(&self, device: &Device) {
+        device.destroy_image_view(self.texture_image_view, None);
+        device.destroy_image(self.texture_image, None);
+        device.free_memory(self.texture_image_memory, None);
+    }
 }
 
 /// The Vulkan handles and associated properties used by our Vulkan app.
@@ -100,11 +117,10 @@ pub struct AppData {
     pub descriptor_pool: vk::DescriptorPool,
     pub descriptor_sets: Vec<vk::DescriptorSet>,
 
-    mip_levels: u32,
-    pub texture_image: vk::Image,
-    pub texture_image_memory: vk::DeviceMemory,
-    pub texture_image_view: vk::ImageView,
     pub texture_sampler: vk::Sampler,
+
+    // TODO Заменить на адекватное хранилище изображений
+    pub device_image: Option<DeviceImage>,
 }
 
 //================================================
@@ -1100,75 +1116,57 @@ pub unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Res
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(buffer_info);
 
-        let info = vk::DescriptorImageInfo::builder()
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image_view(data.texture_image_view)
-            .sampler(data.texture_sampler);
-
-        let image_info = &[info];
-        let sampler_write = vk::WriteDescriptorSet::builder()
-            .dst_set(data.descriptor_sets[i])
-            .dst_binding(1)
-            .dst_array_element(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(image_info);
-
-        device.update_descriptor_sets(&[ubo_write, sampler_write], &[] as &[vk::CopyDescriptorSet]);
+        device.update_descriptor_sets(&[ubo_write], &[] as &[vk::CopyDescriptorSet]);
     }
 
     Ok(())
 }
 
-pub unsafe fn create_texture_image(
+pub unsafe fn upload_texture_image(
     instance: &Instance,
     device: &Device,
-    data: &mut AppData,
-) -> Result<()> {
-    // Load
+    data: &AppData,
+    raw_image: RawImage,
+) -> Result<DeviceImage> {
+    let _span = profile_span!("upload_texture_image");
 
-    // TODO: REMOVE HARDCODE
-    let image = File::open("C:/RustProjects/vulkan-map/resources/texture.png")
-        .map_err(|b| anyhow!("Failed to load texture: {}", b))?;
-
-    let decoder = png::Decoder::new(image);
-    let mut reader = decoder.read_info()?;
-
-    let mut pixels = vec![0; reader.info().raw_bytes()];
-    reader.next_frame(&mut pixels)?;
-
-    let size = reader.info().raw_bytes() as u64;
-    let (width, height) = reader.info().size();
-    data.mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
+    // TODO: переделать с отдельной аллокации для каждого изображения на аллокацию в кольцевом staging buffer-е.
 
     // Create (staging)
-
     let (staging_buffer, staging_buffer_memory) = create_buffer(
         instance,
         device,
         data,
-        size,
+        raw_image.size_bytes,
         vk::BufferUsageFlags::TRANSFER_SRC,
         vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
     )?;
 
     // Copy (staging)
+    let memory = device.map_memory(
+        staging_buffer_memory,
+        0,
+        raw_image.size_bytes,
+        vk::MemoryMapFlags::empty(),
+    )?;
 
-    let memory = device.map_memory(staging_buffer_memory, 0, size, vk::MemoryMapFlags::empty())?;
-
-    memcpy(pixels.as_ptr(), memory.cast(), pixels.len());
+    memcpy(
+        raw_image.pixels.as_ptr(),
+        memory.cast(),
+        raw_image.pixels.len(),
+    );
 
     device.unmap_memory(staging_buffer_memory);
 
-    // Create (image)
-
+    // Create image
     let (texture_image, texture_image_memory) = create_image(
         instance,
         device,
         data,
-        width,
-        height,
-        data.mip_levels,
-        vk::Format::R8G8B8A8_SRGB,
+        raw_image.width,
+        raw_image.height,
+        raw_image.mip_levels,
+        raw_image.format,
         vk::ImageTiling::OPTIMAL,
         vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::TRANSFER_DST
@@ -1176,48 +1174,54 @@ pub unsafe fn create_texture_image(
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
 
-    data.texture_image = texture_image;
-    data.texture_image_memory = texture_image_memory;
-
-    // Transition + Copy (image)
-
+    // Transition + Copy image
     transition_image_layout(
         device,
         data,
-        data.texture_image,
+        texture_image,
         vk::ImageLayout::UNDEFINED,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        data.mip_levels,
+        raw_image.mip_levels,
     )?;
 
     copy_buffer_to_image(
         device,
         data,
         staging_buffer,
-        data.texture_image,
-        width,
-        height,
+        texture_image,
+        raw_image.width,
+        raw_image.height,
     )?;
 
     // Cleanup
-
     device.destroy_buffer(staging_buffer, None);
     device.free_memory(staging_buffer_memory, None);
 
     // Mipmaps
-
     generate_mipmaps(
         instance,
         device,
         data,
-        data.texture_image,
-        vk::Format::R8G8B8A8_SRGB,
-        width,
-        height,
-        data.mip_levels,
+        texture_image,
+        raw_image.format,
+        raw_image.width,
+        raw_image.height,
+        raw_image.mip_levels,
     )?;
 
-    Ok(())
+    // View
+    let texture_image_view = create_image_view(
+        device,
+        texture_image,
+        raw_image.format,
+        raw_image.mip_levels,
+    )?;
+
+    Ok(DeviceImage {
+        texture_image,
+        texture_image_memory,
+        texture_image_view,
+    })
 }
 
 unsafe fn generate_mipmaps(
@@ -1573,17 +1577,6 @@ unsafe fn create_image_view(
     Ok(device.create_image_view(&info, None)?)
 }
 
-pub unsafe fn create_texture_image_view(device: &Device, data: &mut AppData) -> Result<()> {
-    data.texture_image_view = create_image_view(
-        device,
-        data.texture_image,
-        vk::Format::R8G8B8A8_SRGB,
-        data.mip_levels,
-    )?;
-
-    Ok(())
-}
-
 pub unsafe fn create_texture_sampler(device: &Device, data: &mut AppData) -> Result<()> {
     let info = vk::SamplerCreateInfo::builder()
         .mag_filter(vk::Filter::LINEAR)
@@ -1602,7 +1595,7 @@ pub unsafe fn create_texture_sampler(device: &Device, data: &mut AppData) -> Res
         .compare_op(vk::CompareOp::ALWAYS)
         .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
         .min_lod(0.0) // Optional.
-        .max_lod(data.mip_levels as f32)
+        .max_lod(8_f32)
         .mip_lod_bias(0.0); // Optional.
 
     data.texture_sampler = device.create_sampler(&info, None)?;

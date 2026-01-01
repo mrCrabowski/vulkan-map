@@ -9,7 +9,6 @@ use vulkanalia::vk::ExtDebugUtilsExtensionInstanceCommands;
 use vulkanalia::vk::KhrSurfaceExtensionInstanceCommands;
 use vulkanalia::vk::KhrSwapchainExtensionDeviceCommands;
 
-use log::*;
 use winit::window::Window;
 
 use crate::profile_span;
@@ -27,6 +26,7 @@ use super::messages::LoaderMessage;
 use super::messages::RenderMessage;
 
 use super::vulkan_app_data::AppData;
+use super::vulkan_app_data::DeviceImage;
 use super::vulkan_app_data::INDICES;
 use super::vulkan_app_data::MAX_FRAMES_IN_FLIGHT;
 use super::vulkan_app_data::UniformBufferObject;
@@ -45,12 +45,11 @@ use super::vulkan_app_data::create_render_pass;
 use super::vulkan_app_data::create_swapchain;
 use super::vulkan_app_data::create_swapchain_image_views;
 use super::vulkan_app_data::create_sync_objects;
-use super::vulkan_app_data::create_texture_image;
-use super::vulkan_app_data::create_texture_image_view;
 use super::vulkan_app_data::create_texture_sampler;
 use super::vulkan_app_data::create_uniform_buffers;
 use super::vulkan_app_data::create_vertex_buffer;
 use super::vulkan_app_data::pick_physical_device;
+use super::vulkan_app_data::upload_texture_image;
 
 use std::sync::mpsc;
 
@@ -87,8 +86,6 @@ impl App {
         create_pipeline(&device, &mut data)?;
         create_framebuffers(&device, &mut data)?;
         create_command_pool(&instance, &device, &mut data)?;
-        create_texture_image(&instance, &device, &mut data)?;
-        create_texture_image_view(&device, &mut data)?;
         create_texture_sampler(&device, &mut data)?;
         create_vertex_buffer(&instance, &device, &mut data)?;
         create_index_buffer(&instance, &device, &mut data)?;
@@ -120,13 +117,37 @@ impl App {
             .try_iter()
             .for_each(|msg| match msg {
                 RenderMessage::RawImage(raw_image) => {
-                    info!("Got image: {} bytes", raw_image.size_bytes);
+                    //info!("Got image: {} bytes", raw_image.size_bytes);
+                    unsafe {
+                        let device_image = upload_texture_image(
+                            &self.instance,
+                            &self.device,
+                            &self.data,
+                            raw_image,
+                        )
+                        .expect("Failed to upload texture to device");
+
+                        // TODO Продумать хранение текстур, пока просто замена единственной текстуры в AppData
+                        if let Some(device_image) = &self.data.device_image {
+                            device_image.destroy(&self.device);
+                        }
+                        // self.device
+                        //     .destroy_image_view(self.data.texture_image_view, None);
+                        // self.device.destroy_image(self.data.texture_image, None);
+                        // self.device
+                        //     .free_memory(self.data.texture_image_memory, None);
+                        // self.data.texture_image_memory = texture.texture_image_memory;
+                        // self.data.texture_image = texture.texture_image;
+                        // self.data.texture_image_view = texture.texture_image_view;
+
+                        self.data.device_image = Some(device_image);
+                    }
                 }
             });
     }
 
     pub unsafe fn render(&mut self, window: &Window) -> Result<()> {
-        // TODO Remove, test image loading by worker
+        // TODO Remove, for now testing image loading by worker
         self.loader_message_sender.send(LoaderMessage::LoadImage)?;
 
         let _span = profile_span!("render");
@@ -164,8 +185,17 @@ impl App {
         self.data.images_in_flight[image_index] = in_flight_fence;
 
         // Обновление команд и данных
-        self.update_command_buffer(image_index)?;
         self.update_uniform_buffer(image_index)?;
+        // TODO Продумать обновление текстуры из хранилища текстур, пока просто обновляем из AppData
+        // let device_image = DeviceImage {
+        //     texture_image: self.data.texture_image,
+        //     texture_image_memory: self.data.texture_image_memory,
+        //     texture_image_view: self.data.texture_image_view,
+        // };
+        if let Some(device_image) = &self.data.device_image {
+            self.update_sampler_texture(image_index, device_image)?;
+        }
+        self.update_command_buffer(image_index)?;
 
         // 3. Graphics queue (ждёт image_available_semaphores[frame], сигналит render_finished_semaphores[image_index])
         let render_finished = self.data.render_finished_semaphores[image_index as usize];
@@ -243,6 +273,29 @@ impl App {
         Ok(())
     }
 
+    unsafe fn update_sampler_texture(
+        &self,
+        image_index: usize,
+        device_image: &DeviceImage,
+    ) -> Result<()> {
+        let image_info = vk::DescriptorImageInfo::builder()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(device_image.texture_image_view)
+            .sampler(self.data.texture_sampler); // TODO возможно нужны разные для разных мипов
+
+        let image_info = &[image_info];
+
+        let write = vk::WriteDescriptorSet::builder()
+            .dst_set(self.data.descriptor_sets[image_index])
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(image_info);
+
+        self.device
+            .update_descriptor_sets(&[write], &[] as &[vk::CopyDescriptorSet]);
+        Ok(())
+    }
+
     unsafe fn update_command_buffer(&mut self, image_index: usize) -> Result<()> {
         let command_buffer = self.data.command_buffers[image_index];
 
@@ -272,29 +325,37 @@ impl App {
 
         self.device
             .cmd_begin_render_pass(command_buffer, &info, vk::SubpassContents::INLINE);
-        self.device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            self.data.pipeline,
-        );
-        self.device
-            .cmd_bind_vertex_buffers(command_buffer, 0, &[self.data.vertex_buffer], &[0]);
-        self.device.cmd_bind_index_buffer(
-            command_buffer,
-            self.data.index_buffer,
-            0,
-            vk::IndexType::UINT16,
-        );
-        self.device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::GRAPHICS,
-            self.data.pipeline_layout,
-            0,
-            &[self.data.descriptor_sets[image_index]],
-            &[],
-        );
-        self.device
-            .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+
+        if self.data.device_image.is_some() {
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.data.pipeline,
+            );
+            self.device.cmd_bind_vertex_buffers(
+                command_buffer,
+                0,
+                &[self.data.vertex_buffer],
+                &[0],
+            );
+            self.device.cmd_bind_index_buffer(
+                command_buffer,
+                self.data.index_buffer,
+                0,
+                vk::IndexType::UINT16,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.data.pipeline_layout,
+                0,
+                &[self.data.descriptor_sets[image_index]],
+                &[],
+            );
+            self.device
+                .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+        }
+
         self.device.cmd_end_render_pass(command_buffer);
         self.device.end_command_buffer(command_buffer)?;
 
@@ -331,11 +392,10 @@ impl App {
         self.destroy_swapchain();
 
         self.device.destroy_sampler(self.data.texture_sampler, None);
-        self.device
-            .destroy_image_view(self.data.texture_image_view, None);
-        self.device.destroy_image(self.data.texture_image, None);
-        self.device
-            .free_memory(self.data.texture_image_memory, None);
+        if let Some(device_image) = &self.data.device_image {
+            device_image.destroy(&self.device);
+        }
+
         self.device.destroy_buffer(self.data.index_buffer, None);
         self.device.free_memory(self.data.index_buffer_memory, None);
         self.device.destroy_buffer(self.data.vertex_buffer, None);

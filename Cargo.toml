@@ -8,6 +8,7 @@ anyhow = "1"
 log = "0.4"
 cgmath = "0.18"
 png = "0.17"
+image = { version = "^0.24", default-features = false, features = ["png", "jpeg"] }
 pretty_env_logger = "0.5"
 thiserror = "1"
 tobj = { version = "3", features = ["log"] }
