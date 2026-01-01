@@ -131,15 +131,6 @@ impl App {
                         if let Some(device_image) = &self.data.device_image {
                             device_image.destroy(&self.device);
                         }
-                        // self.device
-                        //     .destroy_image_view(self.data.texture_image_view, None);
-                        // self.device.destroy_image(self.data.texture_image, None);
-                        // self.device
-                        //     .free_memory(self.data.texture_image_memory, None);
-                        // self.data.texture_image_memory = texture.texture_image_memory;
-                        // self.data.texture_image = texture.texture_image;
-                        // self.data.texture_image_view = texture.texture_image_view;
-
                         self.data.device_image = Some(device_image);
                     }
                 }
@@ -185,13 +176,10 @@ impl App {
         self.data.images_in_flight[image_index] = in_flight_fence;
 
         // Обновление команд и данных
+        // TODO здесь имеет смысл отдавать одинаковые view и projection матрицы.
+        // И возможно убрать или переделать model матрицу, чтоб перейти к точным тайловым координатам проекции Web Mercator.
         self.update_uniform_buffer(image_index)?;
         // TODO Продумать обновление текстуры из хранилища текстур, пока просто обновляем из AppData
-        // let device_image = DeviceImage {
-        //     texture_image: self.data.texture_image,
-        //     texture_image_memory: self.data.texture_image_memory,
-        //     texture_image_view: self.data.texture_image_view,
-        // };
         if let Some(device_image) = &self.data.device_image {
             self.update_sampler_texture(image_index, device_image)?;
         }
