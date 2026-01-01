@@ -5,6 +5,7 @@ use crate::renderlib::textures::raw_image::RawImage;
 use crate::renderlib::user_event::UserEvent;
 use std::sync::mpsc;
 use std::thread;
+use std::thread::JoinHandle;
 
 use log::*;
 
@@ -25,30 +26,42 @@ struct LoaderThread {
 impl LoaderThread {
     fn run(&mut self) {
         while let Ok(cmd) = self.loader_message_reciever.recv() {
-            let image_path = if self.message_index % 2 == 0 {
-                "C:/RustProjects/vulkan-map/resources/texture.png"
-            } else {
-                "C:/RustProjects/vulkan-map/resources/tile.png"
-            };
             match cmd {
                 LoaderMessage::LoadImage => {
+                    let image_path = if self.message_index % 2 == 0 {
+                        "C:/RustProjects/vulkan-map/resources/texture.png"
+                    } else {
+                        "C:/RustProjects/vulkan-map/resources/tile.png"
+                    };
+
                     match self.load_image(image_path) {
                         Ok(raw) => {
-                            self.render_message_sender
+                            if self
+                                .render_message_sender
                                 .send(RenderMessage::RawImage(raw))
-                                .ok();
+                                .is_err()
+                            {
+                                break;
+                            }
 
-                            self.event_loop_proxy
+                            if self
+                                .event_loop_proxy
                                 .send_event(UserEvent::RequestRenderPoll)
-                                .ok();
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         Err(err) => error!("Failed to load image: {}", err),
                     };
                 }
                 LoaderMessage::Stop => break,
             }
+
             self.message_index += 1;
         }
+
+        debug!("Loader thread exited cleanly");
     }
 
     fn load_image(&self, image_path: &str) -> Result<RawImage> {
@@ -80,7 +93,7 @@ impl LoaderThread {
 pub fn spawn_loader_thread(
     render_message_sender: mpsc::Sender<RenderMessage>,
     event_loop_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
-) -> Result<mpsc::Sender<LoaderMessage>> {
+) -> Result<(mpsc::Sender<LoaderMessage>, JoinHandle<()>)> {
     let (loader_message_sender, loader_message_reciever) = mpsc::channel();
     let mut loader_thread = LoaderThread {
         render_message_sender,
@@ -88,6 +101,6 @@ pub fn spawn_loader_thread(
         event_loop_proxy,
         message_index: 0,
     };
-    thread::spawn(move || loader_thread.run());
-    Ok(loader_message_sender)
+    let join_handle = thread::spawn(move || loader_thread.run());
+    Ok((loader_message_sender, join_handle))
 }

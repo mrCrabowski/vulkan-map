@@ -19,6 +19,7 @@ use std::mem::size_of;
 use std::ptr::copy_nonoverlapping as memcpy;
 type Mat4 = cgmath::Matrix4<f32>;
 
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use super::loader::spawn_loader_thread;
@@ -65,6 +66,7 @@ pub struct App {
     render_message_reciever: mpsc::Receiver<RenderMessage>,
     // TODO: Хардкод на winit для дерганья poll_messages и перерисовки в ивент лупе, нужна адекватная замена.
     // event_loop_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    loader_join_handle: Option<JoinHandle<()>>,
 }
 
 impl App {
@@ -96,8 +98,13 @@ impl App {
         create_sync_objects(&device, &mut data)?;
 
         let (render_message_sender, render_message_reciever) = mpsc::channel();
-        let loader_message_sender =
+        let (loader_message_sender, loader_join_handle) =
             spawn_loader_thread(render_message_sender, event_loop_proxy.clone())?;
+
+        // TODO Remove, testing image loading loop by worker
+        loader_message_sender
+            .send(LoaderMessage::LoadImage)
+            .unwrap();
 
         Ok(Self {
             instance,
@@ -108,6 +115,7 @@ impl App {
             start: Instant::now(),
             loader_message_sender,
             render_message_reciever,
+            loader_join_handle: Some(loader_join_handle),
             // event_loop_proxy,
         })
     }
@@ -133,14 +141,16 @@ impl App {
                         }
                         self.data.device_image = Some(device_image);
                     }
+
+                    // TODO Remove, testing image loading loop by worker
+                    self.loader_message_sender
+                        .send(LoaderMessage::LoadImage)
+                        .unwrap();
                 }
             });
     }
 
     pub unsafe fn render(&mut self, window: &Window) -> Result<()> {
-        // TODO Remove, for now testing image loading by worker
-        self.loader_message_sender.send(LoaderMessage::LoadImage)?;
-
         let _span = profile_span!("render");
         let frame = self.frame;
         let in_flight_fence = self.data.in_flight_fences[frame];
@@ -370,10 +380,11 @@ impl App {
     }
 
     pub unsafe fn destroy(&mut self) {
-        self.loader_message_sender
-            .send(LoaderMessage::Stop)
-            .map_err(|err| anyhow!("Failed to send stop loader thread message: {}", err))
-            .unwrap();
+        self.loader_message_sender.send(LoaderMessage::Stop).ok();
+
+        if let Some(loader_join_handle) = self.loader_join_handle.take() {
+            let _ = loader_join_handle.join();
+        }
 
         self.device.device_wait_idle().unwrap();
 
