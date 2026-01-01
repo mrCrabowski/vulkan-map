@@ -9,9 +9,11 @@ use vulkanalia::vk::ExtDebugUtilsExtensionInstanceCommands;
 use vulkanalia::vk::KhrSurfaceExtensionInstanceCommands;
 use vulkanalia::vk::KhrSwapchainExtensionDeviceCommands;
 
+use log::*;
 use winit::window::Window;
 
 use crate::profile_span;
+use crate::renderlib::user_event::UserEvent;
 
 use cgmath::{Deg, SquareMatrix, point3, vec3};
 use std::mem::size_of;
@@ -19,6 +21,10 @@ use std::ptr::copy_nonoverlapping as memcpy;
 type Mat4 = cgmath::Matrix4<f32>;
 
 use std::time::Instant;
+
+use super::loader::spawn_loader_thread;
+use super::messages::LoaderMessage;
+use super::messages::RenderMessage;
 
 use super::vulkan_app_data::AppData;
 use super::vulkan_app_data::INDICES;
@@ -46,8 +52,9 @@ use super::vulkan_app_data::create_uniform_buffers;
 use super::vulkan_app_data::create_vertex_buffer;
 use super::vulkan_app_data::pick_physical_device;
 
-/// Vulkan app.
-#[derive(Clone, Debug)]
+use std::sync::mpsc;
+
+#[derive(Debug)]
 pub struct App {
     instance: Instance,
     data: AppData,
@@ -55,10 +62,17 @@ pub struct App {
     frame: usize,
     pub resized: bool,
     start: Instant,
+    loader_message_sender: mpsc::Sender<LoaderMessage>,
+    render_message_reciever: mpsc::Receiver<RenderMessage>,
+    // TODO: Хардкод на winit для дерганья poll_messages и перерисовки в ивент лупе, нужна адекватная замена.
+    // event_loop_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
 }
 
 impl App {
-    pub unsafe fn create(window: &Window) -> Result<Self> {
+    pub unsafe fn create(
+        window: &Window,
+        event_loop_proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    ) -> Result<Self> {
         let loader = LibloadingLoader::new(LIBRARY)?;
         let entry = Entry::new(loader).map_err(|b| anyhow!("{}", b))?;
         let mut data = AppData::default();
@@ -83,6 +97,11 @@ impl App {
         create_descriptor_sets(&device, &mut data)?;
         create_command_buffers(&device, &mut data)?;
         create_sync_objects(&device, &mut data)?;
+
+        let (render_message_sender, render_message_reciever) = mpsc::channel();
+        let loader_message_sender =
+            spawn_loader_thread(render_message_sender, event_loop_proxy.clone())?;
+
         Ok(Self {
             instance,
             data,
@@ -90,10 +109,26 @@ impl App {
             frame: 0,
             resized: false,
             start: Instant::now(),
+            loader_message_sender,
+            render_message_reciever,
+            // event_loop_proxy,
         })
     }
 
+    pub fn poll_messages(&mut self) {
+        self.render_message_reciever
+            .try_iter()
+            .for_each(|msg| match msg {
+                RenderMessage::RawImage(raw_image) => {
+                    info!("Got image: {} bytes", raw_image.size_bytes);
+                }
+            });
+    }
+
     pub unsafe fn render(&mut self, window: &Window) -> Result<()> {
+        // TODO Remove, test image loading by worker
+        self.loader_message_sender.send(LoaderMessage::LoadImage)?;
+
         let _span = profile_span!("render");
         let frame = self.frame;
         let in_flight_fence = self.data.in_flight_fences[frame];
@@ -286,6 +321,11 @@ impl App {
     }
 
     pub unsafe fn destroy(&mut self) {
+        self.loader_message_sender
+            .send(LoaderMessage::Stop)
+            .map_err(|err| anyhow!("Failed to send stop loader thread message: {}", err))
+            .unwrap();
+
         self.device.device_wait_idle().unwrap();
 
         self.destroy_swapchain();
